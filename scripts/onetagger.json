@@ -1,0 +1,84 @@
+{
+  "platforms": [
+    "musicbrainz",
+    "beatsource",
+    "deezer",
+    "discogs"
+  ],
+  "path": null,
+  "tags": [
+    "genre"
+  ],
+  "separators": {
+    "id3": ", ",
+    "vorbis": null,
+    "mp4": ", "
+  },
+  "id3v24": true,
+  "overwrite": false,
+  "overwriteTags": ["genre"],
+  "threads": 2,
+  "strictness": 0.9,
+  "mergeGenres": true,
+  "albumArtFile": false,
+  "camelot": true,
+  "parseFilename": false,
+  "filenameTemplate": "%artists% - %title%",
+  "shortTitle": false,
+  "matchDuration": false,
+  "maxDurationDifference": 30,
+  "matchById": false,
+  "multipleMatches": "Default",
+  "postCommand": null,
+  "stylesOptions": "mergeToGenres",
+  "stylesCustomTag": null,
+  "trackNumberLeadingZeroes": 0,
+  "enableShazam": true,
+  "forceShazam": false,
+  "skipTagged": false,
+  "includeSubfolders": true,
+  "onlyYear": true,
+  "titleRegex": null,
+  "moveSuccess": false,
+  "moveSuccessPath": null,
+  "moveFailed": false,
+  "moveFailedPath": null,
+  "writeLrc": false,
+  "enhancedLrc": false,
+  "capitalizeGenres": false,
+  "id3CommLang": "eng",
+  "multiplatform": true,
+  "custom": {
+    "beatport": {
+      "art_resolution": 1600,
+      "ignore_version": false,
+      "max_pages": 1
+    },
+    "itunes": {
+      "art_resolution": 1000
+    },
+    "bpmsupreme": {
+      "email": "",
+      "library": "Supreme",
+      "password": ""
+    },
+    "discogs": {
+      "max_albums": 4,
+      "token": "",
+      "track_number_int": false
+    },
+    "beatsource": {
+      "art_resolution": 500
+    },
+    "deezer": {
+      "art_resolution": 1200
+    },
+    "lastfm": {
+      "api_key": ""
+    },
+    "acoustid": {
+      "api_key": ""
+    }
+  },
+  "spotify": null
+}
