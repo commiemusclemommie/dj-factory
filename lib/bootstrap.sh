@@ -425,7 +425,25 @@ patch_tidal_imports() {
     local cli_file
     local gui_file
 
-    tidal_pkg_dir="$VENV_TIDAL/lib/python3.12/site-packages/tidal_dl_ng"
+    tidal_pkg_dir="$("$VENV_TIDAL/bin/python" - <<'PY'
+import os
+import site
+import sysconfig
+
+site_package_dirs = []
+try:
+    site_package_dirs.extend(site.getsitepackages())
+except AttributeError:
+    pass
+site_package_dirs.append(sysconfig.get_paths().get("purelib", ""))
+site_package_dirs.append(sysconfig.get_paths().get("platlib", ""))
+
+for site_package_dir in site_package_dirs:
+    if site_package_dir and os.path.isdir(os.path.join(site_package_dir, "tidal_dl_ng")):
+        print(os.path.join(site_package_dir, "tidal_dl_ng"))
+        break
+PY
+)" || tidal_pkg_dir=""
     [[ -d "$tidal_pkg_dir" ]] || return 0
 
     cli_file="$tidal_pkg_dir/cli.py"
@@ -513,13 +531,27 @@ setup_environment() {
     log_info "✅ Environment ready."
 }
 
+desktop_exec_escape() {
+    local value="$1"
+
+    # Exec is a quoted desktop-entry argument. Escape characters that have
+    # meaning inside a quoted Exec value before writing the launcher. A literal
+    # percent must be doubled because desktop entries reserve percent codes.
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//%/%%}"
+    printf '%s' "$value"
+}
+
 create_desktop_shortcut() {
     local desktop_file
     local exec_path
+    local escaped_exec_path
     local icon_path
 
     desktop_file="${XDG_DATA_HOME:-$HOME/.local/share}/applications/DJ_Factory.desktop"
     exec_path="$ROOT_DIR/main.sh"
+    escaped_exec_path="$(desktop_exec_escape "$exec_path")"
     icon_path="$ROOT_DIR/icon.png"
 
     mkdir -p "$(dirname "$desktop_file")"
@@ -530,7 +562,7 @@ create_desktop_shortcut() {
 Type=Application
 Name=DJ_Factory
 Comment=Automated Audio Processing Tool
-Exec=$exec_path
+Exec="$escaped_exec_path"
 Icon=$icon_path
 Terminal=true
 Categories=Audio;Utility;

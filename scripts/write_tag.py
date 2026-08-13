@@ -66,10 +66,16 @@ def add_comment(path, text):
 
         else:
             sys.stderr.write(f"Unsupported file type for tagging: {path}\n")
+            return 1
 
     except Exception as e:
         sys.stderr.write(f"Tagging error for {path}: {e}\n")
+        return 1
+
+    return 0
+
 
 if __name__ == "__main__":
     if len(sys.argv) > 2:
-        add_comment(sys.argv[1], sys.argv[2])
+        sys.exit(add_comment(sys.argv[1], sys.argv[2]))
+    sys.exit(1)
