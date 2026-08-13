@@ -20,13 +20,15 @@ try:
             # LOGIC FOR LINUX
             if system_os == "Linux":
                 if 'linux-cli' in url and url.endswith('.tar.gz'):
-                    print(url); sys.exit(0)
+                    print(url)
+                    sys.exit(0)
 
             # LOGIC FOR MAC
             elif system_os == "Darwin":
                 # Matches "macos-cli" or "macos-universal-cli"
                 if 'macos' in url and 'cli' in url and url.endswith('.tar.gz'):
-                    print(url); sys.exit(0)
+                    print(url)
+                    sys.exit(0)
 
 except Exception:
     sys.exit(1)

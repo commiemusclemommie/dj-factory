@@ -32,7 +32,7 @@ prompt_with_current() {
 
     if [[ -t 0 && -t 1 ]]; then
         # -e/-i gives readline editing with the current value prefilled.
-        read -e -i "$current" -p "  $label: " result
+        read -e -r -i "$current" -p "  $label: " result
     else
         read -r -p "  $label [$current]: " result
         [[ -z "$result" ]] && result="$current"
@@ -74,31 +74,51 @@ audio_duration_int() {
 
 safe_remove_stemgen_work() {
     local base_name="$1"
-    local expected_dir="$CURRENT_OUTPUT/$base_name"
-    local expected_stem="$CURRENT_OUTPUT/$base_name.stem.m4a"
+    local output_real
+    local expected_dir
+    local expected_stem
 
     # Stemgen caches/converts inside OUTPUT/base_name. If an earlier Tidal run
     # produced a 30-second preview, that stale work folder can make all future
     # stems 30 seconds even after the FLAC is redownloaded correctly.
-    [[ -d "$expected_dir" ]] && rm -rf "$expected_dir"
-    [[ -f "$expected_stem" ]] && rm -f "$expected_stem"
+    #
+    # A filename such as ".m4a" has an empty stem. Never let that turn the
+    # cleanup target into CURRENT_OUTPUT itself (or a parent/sibling path).
+    if [[ -z "$base_name" || "$base_name" == "." || "$base_name" == ".." || "$base_name" == */* ]]; then
+        echo "    ⚠️ Skipping unsafe Stemgen cleanup for empty/invalid basename." >&2
+        return 0
+    fi
+
+    output_real="$(absolute_path "$CURRENT_OUTPUT")"
+    [[ -d "$output_real" ]] || return 0
+    expected_dir="$output_real/$base_name"
+    expected_stem="$output_real/$base_name.stem.m4a"
+
+    # Both targets must be direct children of the resolved output directory.
+    [[ "$expected_dir" != "$output_real" && "$(dirname -- "$expected_dir")" == "$output_real" ]] || return 0
+    if [[ -d "$expected_dir" ]] && ! rm -rf -- "$expected_dir"; then
+        return 1
+    fi
+    if [[ -f "$expected_stem" ]] && ! rm -f -- "$expected_stem"; then
+        return 1
+    fi
+    return 0
 }
 
 run_interruptible_command() {
     local pid
     local status
 
-    if command -v setsid >/dev/null 2>&1; then
-        setsid "$@" < /dev/null &
-    else
-        "$@" < /dev/null &
-    fi
+    # Keep external work in the worker's supervised process group. Creating a
+    # new session here would let a descendant survive owner death and mutate
+    # after the lock is released.
+    "$@" < /dev/null &
 
     pid=$!
     ACTIVE_CHILD_PID="$pid"
     wait "$pid"
     status=$?
-    ACTIVE_CHILD_PID=""
+    export ACTIVE_CHILD_PID=""
     return "$status"
 }
 
@@ -133,11 +153,12 @@ quarantine_short_tidal_previews() {
 safe_copy_to_dir() {
     local source_path="$1"
     local destination_dir="$2"
-    local target_path="$destination_dir/$(basename "$source_path")"
+    local target_path
     local source_real
     local target_real
 
-    mkdir -p "$destination_dir"
+    target_path="$destination_dir/$(basename "$source_path")"
+    mkdir -p "$destination_dir" || return 1
 
     source_real="$(absolute_path "$source_path")"
     target_real="$(absolute_path "$target_path")"
@@ -365,7 +386,7 @@ show_menu() {
 
         read -r -p "  > " choice
         case "$choice" in
-            [0-4]) SELECTIONS[$choice]=$((1 - SELECTIONS[$choice])) ;;
+            [0-4]) SELECTIONS[choice]=$((1 - SELECTIONS[choice])) ;;
             i|I)
                 new_in="$(prompt_with_current "Input" "$CURRENT_INPUT")"
                 [[ -n "$new_in" ]] && CURRENT_INPUT="$new_in"
@@ -417,6 +438,7 @@ process_single_file() {
     local source_duration=0
     local processed_duration=0
     local stem_duration=0
+    local file_failed=0
 
     filename="$(basename "$raw_file")"
     base_name="${filename%.*}"
@@ -432,6 +454,7 @@ process_single_file() {
         echo "    🏷️  Running OneTagger..."
         if ! timeout 2m "$BIN_DIR/onetagger-cli" autotagger --config "$ONETAGGER_CONF" --path "$current_source"; then
             echo -e "    ${YELLOW}⚠️ OneTagger failed or timed out; continuing.${NC}" >&2
+            file_failed=1
         fi
     fi
 
@@ -470,11 +493,15 @@ process_single_file() {
         else
             echo "    🔨 Handing off to Stemgen..."
 
-            safe_remove_stemgen_work "$base_name"
+            if ! safe_remove_stemgen_work "$base_name"; then
+                echo -e "    ${YELLOW}⚠️ Failed to remove stale Stemgen work for $filename.${NC}" >&2
+                file_failed=1
+            fi
             stem_count_before=$(find "$CURRENT_OUTPUT" -maxdepth 1 -name "*.stem.m4a" -type f 2>/dev/null | wc -l)
 
             if ! run_interruptible_command "$STEMGEN_BIN" -i "$processed_file" -n "$STEM_MODEL" --device "$STEM_DEVICE" -o "$CURRENT_OUTPUT/"; then
                 echo -e "    ${YELLOW}⚠️ Stemgen failed for $filename${NC}" >&2
+                file_failed=1
             else
                 stem_count_after=$(find "$CURRENT_OUTPUT" -maxdepth 1 -name "*.stem.m4a" -type f 2>/dev/null | wc -l)
                 if [[ "$stem_count_after" -gt "$stem_count_before" ]]; then
@@ -498,13 +525,16 @@ process_single_file() {
                     stem_duration="$(audio_duration_int "$stem_file")"
                     if (( processed_duration >= 60 && stem_duration > 0 && stem_duration < processed_duration - 10 )); then
                         echo -e "    ${YELLOW}⚠️ Stemgen produced a short stem (${stem_duration}s vs ${processed_duration}s); deleting it.${NC}" >&2
-                        rm -f "$stem_file"
+                        if ! rm -f -- "$stem_file"; then
+                            file_failed=1
+                        fi
                     else
                         stem_created=1
                         echo "    ✅ Stem Created: $(basename "$stem_file")"
                     fi
                 else
                     echo -e "    ${YELLOW}⚠️ Stem file not found after stemgen run.${NC}" >&2
+                    file_failed=1
                 fi
             fi
 
@@ -524,28 +554,48 @@ process_single_file() {
         if [[ "$stem_created" -eq 1 && -f "$stem_file" ]]; then
             check_file="$stem_file"
         fi
-        detune_out=$("$PYTHON_PROC" "$SCRIPT_DIR/analyze_stems.py" "$check_file" 2>&1 | tail -n 1)
-        if [[ "$detune_out" =~ ^[+-][0-9]+c$ ]]; then
-            detune_tag="$detune_out"
+        local detune_output
+        if detune_output=$("$PYTHON_PROC" "$SCRIPT_DIR/analyze_stems.py" "$check_file" 2>&1); then
+            detune_out="$(printf '%s\n' "$detune_output" | tail -n 1)"
+            if [[ "$detune_out" =~ ^[+-][0-9]+c$ ]]; then
+                detune_tag="$detune_out"
+            fi
+        else
+            echo -e "    ${YELLOW}⚠️ Detune analysis failed for $filename; continuing.${NC}" >&2
+            file_failed=1
         fi
     fi
 
     if [[ -n "$detune_tag" ]]; then
-        "$PYTHON_PROC" "$SCRIPT_DIR/write_tag.py" "$output_file" "$detune_tag"
-        if [[ "$stem_created" -eq 1 && -f "$stem_file" ]]; then
-            "$PYTHON_PROC" "$SCRIPT_DIR/write_tag.py" "$stem_file" "$detune_tag"
+        if ! "$PYTHON_PROC" "$SCRIPT_DIR/write_tag.py" "$output_file" "$detune_tag"; then
+            echo -e "    ${YELLOW}⚠️ Failed to tag $filename.${NC}" >&2
+            file_failed=1
+        elif [[ "$stem_created" -eq 1 && -f "$stem_file" ]]; then
+            if ! "$PYTHON_PROC" "$SCRIPT_DIR/write_tag.py" "$stem_file" "$detune_tag"; then
+                echo -e "    ${YELLOW}⚠️ Failed to tag $(basename "$stem_file").${NC}" >&2
+                file_failed=1
+            else
+                echo "    🎹 Tagged: $detune_tag"
+            fi
+        else
+            echo "    🎹 Tagged: $detune_tag"
         fi
-        echo "    🎹 Tagged: $detune_tag"
     fi
 
-    return 0
+    return "$file_failed"
 }
 
 # ==============================================
 # PIPELINE
 # ==============================================
 run_pipeline() {
-    mkdir -p "$CURRENT_OUTPUT" "$TMP_DIR"
+    local pipeline_failed=0
+    local raw_file
+
+    if ! mkdir -p "$CURRENT_OUTPUT" "$TMP_DIR"; then
+        echo -e "${RED}❌ Failed to prepare pipeline directories.${NC}" >&2
+        return 1
+    fi
     RUN_TMP_DIR="$(mktemp -d "$TMP_DIR/run.XXXXXX")" || {
         echo -e "${RED}❌ Failed to create repo-local temp directory in $TMP_DIR${NC}" >&2
         return 1
@@ -554,42 +604,62 @@ run_pipeline() {
     if [[ ${SELECTIONS[0]} -eq 1 ]]; then
         echo -e "${YELLOW}🌊 Tidal Download Setup${NC}"
 
-        if [[ ! -x "$TIDAL_BIN" ]]; then
+        if [[ ! -x "${TIDAL_BIN:-}" ]]; then
+            # Tidal is an optional setup component; preserve the existing
+            # degraded local-processing mode when its environment is absent.
             echo -e "${YELLOW}⚠️ Tidal environment is not available; skipping download step.${NC}" >&2
+        elif ! "$BOOTSTRAP_PYTHON" "$SCRIPT_DIR/update_tidal_config.py" "$CURRENT_INPUT"; then
+            echo -e "${RED}⚠️ Tidal configuration update failed; download skipped.${NC}" >&2
+            pipeline_failed=1
         else
-            "$BOOTSTRAP_PYTHON" "$SCRIPT_DIR/update_tidal_config.py" "$CURRENT_INPUT"
-
+            local tidal_ready=1
             if ! "$TIDAL_BIN" cfg >/dev/null 2>&1; then
                 echo -e "${RED}⚠️  Login Required...${NC}"
-                "$TIDAL_BIN" login
-            fi
-
-            TIDAL_LINK="${CURRENT_TIDAL:-}"
-            if [[ -f "$TIDAL_URL_FILE" ]]; then
-                SAVED_URL="$(<"$TIDAL_URL_FILE")"
-                SAVED_URL="$(normalize_tidal_link "$SAVED_URL")"
-                echo -e "    📂 Saved Tidal URL: ${CYAN}$SAVED_URL${NC}"
-                echo "    Press Enter to keep it, or edit/paste a different Tidal URL."
-                TIDAL_LINK="$(prompt_with_current "Tidal URL" "$SAVED_URL")"
-            else
-                TIDAL_LINK="$(prompt_with_current "Tidal URL" "")"
-            fi
-
-            TIDAL_LINK="$(normalize_tidal_link "${TIDAL_LINK:-}")"
-            CURRENT_TIDAL="$TIDAL_LINK"
-
-            if [[ -n "${TIDAL_LINK:-}" ]]; then
-                printf '%s\n' "$TIDAL_LINK" > "$TIDAL_URL_FILE"
-                echo -e "    🌊 Downloading: ${CYAN}$TIDAL_LINK${NC}"
-                if ! "$TIDAL_BIN" dl "$TIDAL_LINK"; then
-                    echo -e "    ${YELLOW}⚠️ Tidal download failed. Check that the playlist is public/available to your logged-in Tidal account.${NC}" >&2
+                if ! "$TIDAL_BIN" login; then
+                    echo -e "${RED}⚠️ Tidal login failed; download skipped.${NC}" >&2
+                    pipeline_failed=1
+                    tidal_ready=0
                 fi
-                quarantine_short_tidal_previews "$CURRENT_INPUT"
+            fi
+
+            if [[ "$tidal_ready" -eq 1 ]]; then
+                TIDAL_LINK="${CURRENT_TIDAL:-}"
+                if [[ -f "$TIDAL_URL_FILE" ]]; then
+                    SAVED_URL="$(<"$TIDAL_URL_FILE")"
+                    SAVED_URL="$(normalize_tidal_link "$SAVED_URL")"
+                    echo -e "    📂 Saved Tidal URL: ${CYAN}$SAVED_URL${NC}"
+                    echo "    Press Enter to keep it, or edit/paste a different Tidal URL."
+                    TIDAL_LINK="$(prompt_with_current "Tidal URL" "$SAVED_URL")"
+                else
+                    TIDAL_LINK="$(prompt_with_current "Tidal URL" "")"
+                fi
+
+                TIDAL_LINK="$(normalize_tidal_link "${TIDAL_LINK:-}")"
+                CURRENT_TIDAL="$TIDAL_LINK"
+
+                if [[ -n "${TIDAL_LINK:-}" ]]; then
+                    if ! printf '%s\n' "$TIDAL_LINK" > "$TIDAL_URL_FILE"; then
+                        echo -e "${RED}⚠️ Failed to save Tidal URL; download skipped.${NC}" >&2
+                        pipeline_failed=1
+                    else
+                        echo -e "    🌊 Downloading: ${CYAN}$TIDAL_LINK${NC}"
+                        if ! "$TIDAL_BIN" dl "$TIDAL_LINK"; then
+                            echo -e "    ${YELLOW}⚠️ Tidal download failed. Check that the playlist is public/available to your logged-in Tidal account.${NC}" >&2
+                            pipeline_failed=1
+                        fi
+                        quarantine_short_tidal_previews "$CURRENT_INPUT"
+                    fi
+                fi
             fi
         fi
     fi
 
     echo -e "\n${GREEN}🚀 PROCESSING BATCH...${NC}"
+
+    if [[ ! -d "$CURRENT_INPUT" ]]; then
+        echo -e "${RED}❌ Input directory does not exist: $CURRENT_INPUT${NC}" >&2
+        return 1
+    fi
 
     mapfile -d $'\0' -t FILE_LIST < <(
         find "$CURRENT_INPUT" -maxdepth 1 -type f \
@@ -598,14 +668,16 @@ run_pipeline() {
 
     if [[ ${#FILE_LIST[@]} -eq 0 ]]; then
         echo -e "${YELLOW}⚠️ No audio files found in $CURRENT_INPUT${NC}"
-        return 0
+        return "$pipeline_failed"
     fi
 
-    local raw_file
     for raw_file in "${FILE_LIST[@]}"; do
         [[ -z "$raw_file" ]] && continue
         if ! process_single_file "$raw_file"; then
             echo -e "${YELLOW}⚠️ Failed to process $(basename "$raw_file"); continuing with next file.${NC}" >&2
+            pipeline_failed=1
         fi
     done
+
+    return "$pipeline_failed"
 }

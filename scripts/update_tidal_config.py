@@ -2,6 +2,78 @@ import json
 import os
 import shutil
 import sys
+import tempfile
+
+
+def atomic_write_json(path, data):
+    """Atomically replace a file, preserving a symlink at ``path``."""
+    replacement_path = os.path.realpath(path) if os.path.islink(path) else path
+    if os.path.islink(path) and not os.path.isfile(replacement_path):
+        raise OSError(f"settings symlink target is not a regular file: {replacement_path}")
+
+    directory = os.path.dirname(os.path.abspath(replacement_path)) or "."
+    temporary_path = None
+
+    try:
+        file_descriptor, temporary_path = tempfile.mkstemp(
+            prefix=f".{os.path.basename(replacement_path)}.",
+            suffix=".tmp",
+            dir=directory,
+        )
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as config_file:
+            json.dump(data, config_file, indent=4)
+            config_file.write("\n")
+            config_file.flush()
+            os.fsync(config_file.fileno())
+
+        if os.path.exists(replacement_path):
+            shutil.copymode(replacement_path, temporary_path)
+        os.replace(temporary_path, replacement_path)
+        temporary_path = None
+
+        directory_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except Exception:
+        if temporary_path is not None:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
+        raise
+
+
+def load_json_object(path):
+    """Return settings or raise for missing, unreadable, or malformed data."""
+    with open(path, encoding="utf-8") as config_file:
+        data = json.load(config_file)
+    if not isinstance(data, dict):
+        raise ValueError("settings JSON must contain an object")
+    return data
+
+
+def choose_config(paths):
+    primary_path, legacy_path = paths
+    invalid_paths = []
+
+    for path in paths:
+        if not os.path.lexists(path):
+            continue
+        try:
+            return path, load_json_object(path)
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            invalid_paths.append((path, error))
+            print(f"⚠️ Failed to read {path}: {error}", file=sys.stderr)
+
+    # A malformed primary is repaired in place only when no valid legacy file
+    # exists. If the primary is a symlink, atomic_write_json updates its target
+    # and refuses a dangling link rather than replacing the link itself.
+    if any(path == primary_path for path, _ in invalid_paths) or not os.path.lexists(legacy_path):
+        return primary_path, {}
+    return primary_path, {}
+
 
 if len(sys.argv) < 2:
     print("Error: No target directory provided.")
@@ -20,44 +92,27 @@ DESIRED_SETTINGS = {
     "quality_audio": "HI_RES_LOSSLESS",
     "format_playlist": "{artist_name} - {track_title}",
     "format_track": "{artist_name} - {track_title}",
-    "format_album": "{artist_name} - {track_title}"
+    "format_album": "{artist_name} - {track_title}",
 }
 
 possible_paths = [
     os.path.expanduser("~/.config/tidal_dl_ng/settings.json"),
-    os.path.expanduser("~/.tidal-dl.json")
+    os.path.expanduser("~/.tidal-dl.json"),
 ]
 
-config_found = False
+try:
+    config_path, data = choose_config(possible_paths)
+    if os.path.lexists(config_path):
+        print(f"Using config at: {config_path}")
+    else:
+        print(f"No config found. Creating new at: {config_path}")
+        os.makedirs(os.path.dirname(config_path), exist_ok=True)
 
-for config_path in possible_paths:
-    if os.path.exists(config_path):
-        print(f"Found config at: {config_path}")
-        try:
-            with open(config_path, 'r') as f:
-                data = json.load(f)
+    for key, value in DESIRED_SETTINGS.items():
+        data[key] = value
 
-            for key, value in DESIRED_SETTINGS.items():
-                data[key] = value
-
-            with open(config_path, 'w') as f:
-                json.dump(data, f, indent=4)
-
-            print("✅ Config updated successfully.")
-            config_found = True
-            break
-        except Exception as e:
-            print(f"⚠️ Failed to update {config_path}: {e}")
-
-if not config_found:
-    default_path = possible_paths[0]
-    print(f"No config found. Creating new at: {default_path}")
-
-    try:
-        os.makedirs(os.path.dirname(default_path), exist_ok=True)
-        with open(default_path, 'w') as f:
-            json.dump(DESIRED_SETTINGS, f, indent=4)
-        print("✅ New config created.")
-    except Exception as e:
-        print(f"❌ Critical Error creating config: {e}")
-        sys.exit(1)
+    atomic_write_json(config_path, data)
+    print("✅ Config updated successfully.")
+except Exception as error:
+    print(f"❌ Failed to update {config_path}: {error}", file=sys.stderr)
+    sys.exit(1)

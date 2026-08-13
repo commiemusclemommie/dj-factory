@@ -1,9 +1,37 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2218,SC2329  # die is defined before sourced implementations; traps and dynamic PID traversal invoke functions.
 # main.sh
 
 set -uo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Keep the lock supervisor outside the worker process. If this owner shell is
+# SIGKILLed, the supervisor remains alive long enough to terminate and reap
+# the worker's process group before releasing flock.
+if [[ "${DJ_FACTORY_LOCK_SUPERVISED:-0}" != "1" ]]; then
+    lock_python=""
+    for candidate in "${BOOTSTRAP_PYTHON:-}" python3 python; do
+        [[ -n "$candidate" ]] || continue
+        if command -v "$candidate" >/dev/null 2>&1 && \
+            "$candidate" -c 'import sys; raise SystemExit(sys.version_info < (3, 10))' >/dev/null 2>&1; then
+            lock_python="$(command -v "$candidate")"
+            break
+        fi
+    done
+    [[ -n "$lock_python" ]] || {
+        echo "Could not find a usable Python interpreter (>= 3.10) for the pipeline lock." >&2
+        exit 1
+    }
+    mkdir -p "$ROOT_DIR/.state" || exit 1
+    export DJ_FACTORY_LOCK_SUPERVISED=1
+    "$lock_python" "$ROOT_DIR/scripts/hold_run_lock.py" --supervise \
+        "$ROOT_DIR/.state/run.lock" "$$" "$ROOT_DIR/main.sh" &
+    lock_supervisor_pid=$!
+    wait "$lock_supervisor_pid"
+    exit $?
+fi
+
 LIB_DIR="$ROOT_DIR/lib"
 LOG_DIR="$ROOT_DIR/logs"
 LOG_FILE="$LOG_DIR/dj-factory-$(date +%Y%m%d-%H%M%S).log"
@@ -59,37 +87,15 @@ terminate_descendants() {
     fi
 }
 
-acquire_run_lock() {
-    LOCK_FILE="$STATE_DIR/run.lock"
-    mkdir -p "$STATE_DIR"
-
-    if [[ -f "$LOCK_FILE" ]]; then
-        local existing_pid
-        local existing_cmd=""
-        existing_pid="$(<"$LOCK_FILE")"
-
-        if [[ -n "$existing_pid" ]] && kill -0 "$existing_pid" 2>/dev/null; then
-            existing_cmd="$(ps -p "$existing_pid" -o args= 2>/dev/null || true)"
-            if [[ "$existing_cmd" == *"$ROOT_DIR/main.sh"* || "$existing_cmd" == *"distrobox enter $BOX_NAME"* ]]; then
-                die "dj-factory is already running (PID $existing_pid). Stop it with: kill $existing_pid"
-            fi
-            echo "Removing stale dj-factory lock for reused PID $existing_pid ($existing_cmd)."
-        fi
-
-        rm -f "$LOCK_FILE"
-    fi
-
-    printf '%s\n' "$$" > "$LOCK_FILE"
-}
-
 if [[ "$(uname -s)" != "Linux" ]]; then
     die "DJ_Factory currently supports Linux only."
 fi
 
-for required_file in "$LIB_DIR/config.sh" "$LIB_DIR/bootstrap.sh" "$LIB_DIR/processing.sh"; do
+for required_file in "$LIB_DIR/config.sh" "$LIB_DIR/bootstrap.sh" "$LIB_DIR/processing.sh" "$LIB_DIR/run_lock.sh"; do
     [[ -r "$required_file" ]] || die "Missing required file: $required_file"
 done
 
+# shellcheck source=lib/config.sh
 source "$LIB_DIR/config.sh"
 
 ensure_distrobox() {
@@ -135,29 +141,34 @@ enter_distrobox_if_needed() {
     fi
 
     echo -e "\033[0;32m🚀 Entering $BOX_NAME...\033[0m"
-    exec distrobox enter "$BOX_NAME" -- "$ROOT_DIR/main.sh"
+    exec distrobox enter "$BOX_NAME" -- env DJ_FACTORY_LOCK_SUPERVISED=1 "$ROOT_DIR/main.sh"
 }
 
 enter_distrobox_if_needed
 
+# shellcheck source=lib/bootstrap.sh
 source "$LIB_DIR/bootstrap.sh"
+# shellcheck source=lib/processing.sh
 source "$LIB_DIR/processing.sh"
+# shellcheck source=lib/run_lock.sh
+source "$LIB_DIR/run_lock.sh"
 
 cleanup() {
     local exit_code=$?
 
+    stop_run_lock_watchdog
     terminate_descendants
 
     if [[ -n "${RUN_TMP_DIR:-}" && -d "${RUN_TMP_DIR:-}" ]]; then
         rm -rf "$RUN_TMP_DIR"
     fi
 
-    if [[ -n "${LOCK_FILE:-}" && -f "${LOCK_FILE:-}" ]]; then
-        local lock_pid
-        lock_pid="$(<"$LOCK_FILE" 2>/dev/null || true)"
-        if [[ "$lock_pid" == "$$" ]]; then
-            rm -f "$LOCK_FILE"
-        fi
+    if [[ -n "${RUN_LOCK_HELPER_PID:-}" ]]; then
+        kill -TERM "$RUN_LOCK_HELPER_PID" 2>/dev/null || true
+        wait "$RUN_LOCK_HELPER_PID" 2>/dev/null || true
+    fi
+    if [[ -n "${RUN_LOCK_STATUS_FILE:-}" ]]; then
+        rm -f -- "$RUN_LOCK_STATUS_FILE"
     fi
 
     if [[ $exit_code -eq 0 ]]; then
@@ -178,7 +189,9 @@ handle_signal() {
 trap cleanup EXIT
 trap handle_signal INT TERM
 
-acquire_run_lock
+if [[ "${DJ_FACTORY_LOCK_SUPERVISED:-0}" != "1" ]]; then
+    acquire_run_lock
+fi
 
 echo -e "${CYAN}🧱 DJ_Factory Linux bootstrap${NC}"
 echo -e "${YELLOW}Repo:${NC} $ROOT_DIR"
@@ -192,6 +205,8 @@ fi
 setup_environment
 create_desktop_shortcut
 show_menu
-run_pipeline
+pipeline_status=0
+run_pipeline || pipeline_status=$?
 
-read -r -p "Press Enter to close..."
+read -r -p "Press Enter to close..." || true
+exit "$pipeline_status"
